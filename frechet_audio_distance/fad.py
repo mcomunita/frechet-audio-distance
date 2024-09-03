@@ -11,6 +11,7 @@ import resampy
 import soundfile as sf
 import torch
 import laion_clap
+import yaml
 
 from multiprocessing.dummy import Pool as ThreadPool
 from scipy import linalg
@@ -18,6 +19,8 @@ from torch import nn
 from tqdm import tqdm
 
 from .models.pann import Cnn14, Cnn14_8k, Cnn14_16k
+from .models.afx_rep import Cnn14 as AFXRepCnn14
+from .models.afx_rep_utils import get_param_embeds
 from .utils import load_audio_task
 
 from encodec import EncodecModel
@@ -41,7 +44,7 @@ class FrechetAudioDistance:
         Initialize FAD
 
         -- ckpt_dir: folder where the downloaded checkpoints are stored
-        -- model_name: one between vggish, pann, clap or encodec
+        -- model_name: one between vggish, pann, clap, encodec, afx-rep
         -- submodel_name: only for clap models - determines which checkpoint to use. 
                           options: ["630k-audioset", "630k", "music_audioset", "music_speech", "music_speech_audioset"]
         -- sample_rate: one between [8000, 16000, 32000, 48000]. depending on the model set the sample rate to use
@@ -50,7 +53,7 @@ class FrechetAudioDistance:
         -- use_activation: whether to use the output activation in vggish
         -- enable_fusion: whether to use fusion for clap models (valid depending on the specific submodel used)
         """
-        assert model_name in ["vggish", "pann", "clap", "encodec"], "model_name must be either 'vggish', 'pann', 'clap' or 'encodec'"
+        assert model_name in ["vggish", "pann", "clap", "encodec", "afx-rep"], "model_name must be either 'vggish', 'pann', 'clap', 'encodec' or 'afx-rep'"
         if model_name == "vggish":
             assert sample_rate == 16000, "sample_rate must be 16000"
         elif model_name == "pann":
@@ -62,6 +65,8 @@ class FrechetAudioDistance:
             assert sample_rate in [24000, 48000], "sample_rate must be 24000 or 48000"
             if sample_rate == 48000:
                 assert channels == 2, "channels must be 2 for 48khz encodec model"
+        elif model_name == "afx-rep":
+            assert sample_rate == 48000, "sample_rate must be 48000"
         self.model_name = model_name
         self.submodel_name = submodel_name
         self.sample_rate = sample_rate
@@ -220,13 +225,51 @@ class FrechetAudioDistance:
             # 24kbps is the max bandwidth supported by both versions
             # these models use 32 residual quantizers
             self.model.set_target_bandwidth(24.0)
+        
+        # afx-rep
+        elif model_name == "afx-rep":
+            ckpt_path = os.path.join(self.ckpt_dir, "afx-rep.ckpt")
+            config_path = os.path.join(self.ckpt_dir, "config.yaml")
+
+            # download checkpoint and config
+            if not os.path.exists(ckpt_path):
+                os.makedirs(self.ckpt_dir, exist_ok=True)
+                torch.hub.download_url_to_file(
+                    url=f"https://huggingface.co/csteinmetz1/afx-rep/resolve/main/afx-rep.ckpt",
+                    dst=ckpt_path,
+                )
+            if not os.path.exists(config_path):
+                os.makedirs(self.ckpt_dir, exist_ok=True)
+                torch.hub.download_url_to_file(
+                    url=f"https://huggingface.co/csteinmetz1/afx-rep/resolve/main/config.yaml",
+                    dst=config_path,
+                )
+            
+            # load config
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
+
+            # init model
+            encoder_configs = config["model"]["init_args"]["encoder"]
+            self.model = AFXRepCnn14(**encoder_configs["init_args"])
+
+            # load checkpoint
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+
+            # load state dicts
+            state_dict = {}
+            for k, v in checkpoint["state_dict"].items():
+                if k.startswith("encoder"):
+                    state_dict[k.replace("encoder.", "", 1)] = v
+
+            self.model.load_state_dict(state_dict)
 
         self.model.to(self.device)
         self.model.eval()
 
     def get_embeddings(self, x, sr):
         """
-        Get embeddings using VGGish, PANN, CLAP or EnCodec models.
+        Get embeddings using VGGish, PANN, CLAP, EnCodec or AFX-Rep models.
         Params:
         -- x    : a list of np.ndarray audio samples
         -- sr   : sampling rate.
@@ -236,19 +279,20 @@ class FrechetAudioDistance:
             for audio in tqdm(x, disable=(not self.verbose)):
                 if self.model_name == "vggish":
                     embd = self.model.forward(audio, sr)
+                
                 elif self.model_name == "pann":
                     with torch.no_grad():
                         audio = torch.tensor(audio).float().unsqueeze(0).to(self.device)
                         out = self.model(audio, None)
                         embd = out['embedding'].data[0]
+                
                 elif self.model_name == "clap":
                     audio = torch.tensor(audio).float().unsqueeze(0)
                     embd = self.model.get_audio_embedding_from_data(audio, use_tensor=True)
 
                 elif self.model_name == "encodec":
                     # add two dimensions
-                    audio = torch.tensor(
-                        audio).float().unsqueeze(0).unsqueeze(0).to(self.device)
+                    audio = torch.tensor(audio).float().unsqueeze(0).unsqueeze(0).to(self.device)
                     # if SAMPLE_RATE is 48000, we need to make audio stereo
                     if self.model.sample_rate == 48000:
                         if audio.shape[-1] != 2:
@@ -272,6 +316,21 @@ class FrechetAudioDistance:
                         # encodec embedding (before quantization)
                         embd = self.model.encoder(audio)
                         embd = embd.squeeze(0)
+                
+                elif self.model_name == "afx-rep":
+                    audio = torch.tensor(audio).float().unsqueeze(0).unsqueeze(0).to(self.device)
+                    embd = get_param_embeds(
+                        audio,
+                        self.model,
+                        sample_rate=sr,
+                        requires_grad=False,
+                        peak_normalize=False,
+                        dropout=0.0,
+                    )
+                    if self.channels == 2: # if stereo, concat mid and side embeddings
+                        embd = torch.cat((embd["mid"], embd["side"]), dim=-1)
+                    else:
+                        embd = embd["mid"] # only use mid embeddings (mono part), ignore side embeddings (stereo part)
 
                 if self.verbose:
                     print(
