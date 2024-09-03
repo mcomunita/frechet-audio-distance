@@ -2,6 +2,9 @@
 
 # Python Project
 checkpoints/
+test/background
+test/test1
+test/test2
 __pycache__/
 .conda/
 .pytest_cache/
